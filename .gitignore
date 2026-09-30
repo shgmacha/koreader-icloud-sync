@@ -1,0 +1,8 @@
+.DS_Store
+*.zip
+__pycache__/
+*.pyc
+# Internal planning notes (not part of the published project)
+tasks/
+# Never commit bridge config: it holds the sync token
+config.json
