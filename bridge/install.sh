@@ -64,17 +64,44 @@ if [[ ! -x "$LAUNCHER" || "$SRC_DIR/launcher/main.c" -nt "$LAUNCHER" ]]; then
 </dict>
 </plist>
 EOF
-  clang -O2 -o "$LAUNCHER" "$SRC_DIR/launcher/main.c"
-  codesign --force --sign - --identifier com.koreader.icloudbridge "$BRIDGE_APP"
+  if "$SRC_DIR/build_launcher.sh" "$LAUNCHER"; then
+    codesign --force --sign - --identifier com.koreader.icloudbridge "$BRIDGE_APP"
+  else
+    echo "⚠️  Couldn't build the helper app (see the compiler error above)."
+    echo "   Continuing without it: the bridge will run with Python directly."
+  fi
 fi
 
-sed -e "s|__LAUNCHER__|$LAUNCHER|" -e "s|__PYTHON__|$REAL_PYTHON|" -e "s|__SCRIPT__|$SCRIPT|" \
+# Without the helper app, launchd runs Python directly.
+if [[ -x "$LAUNCHER" ]]; then
+  LAUNCH_LINE="s|__LAUNCHER__|$LAUNCHER|"
+  ACCESS_APP="$BRIDGE_APP"
+else
+  LAUNCH_LINE="/__LAUNCHER__/d"
+  ACCESS_APP="${REAL_PYTHON%/Contents/MacOS/*}"
+fi
+
+sed -e "$LAUNCH_LINE" -e "s|__PYTHON__|$REAL_PYTHON|" -e "s|__SCRIPT__|$SCRIPT|" \
     -e "s|__CONFIG__|$CONFIG|" -e "s|__LOG__|$LOG|g" \
     "$SRC_DIR/$LABEL.plist" > "$PLIST"
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 LOG_START=$(( $(wc -c < "$LOG" 2>/dev/null || echo 0) + 1 ))
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# bootout returns before the old agent has fully stopped; bootstrapping too
+# early fails with "Bootstrap failed: 5: Input/output error". Wait, then retry.
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 20); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
+loaded=0
+for _ in 1 2 3 4 5; do
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then loaded=1; break; fi
+  sleep 1
+done
+if [[ "$loaded" != 1 ]]; then
+  echo "❌ Couldn't start the bridge service. Try running this script again, or log out and back in."
+  exit 1
+fi
 
 read_cfg() { "$PYTHON" -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$CONFIG" "$1"; }
 PORT="$(read_cfg port)"
@@ -97,12 +124,20 @@ else
   if tail -c +"$LOG_START" "$LOG" 2>/dev/null | grep -q "Operation not permitted"; then
     echo "   macOS is blocking background access to iCloud Drive. To allow it:"
     echo "   1. In the Full Disk Access list that just opened, click +"
-    echo "   2. Press ⌘⇧G, paste  ~/Applications  and choose 'KOReader iCloud Bridge'"
-    echo "      (or drag it in from the Finder window that just opened)"
+    echo "   2. Press ⌘⇧G, paste the path below and choose it"
+    echo "      (or drag it in from the Finder window that just opened):"
+    echo "        $ACCESS_APP"
     echo "   3. Make sure its switch is on, then run this script again."
-    open -R "$BRIDGE_APP" 2>/dev/null || true
+    open -R "$ACCESS_APP" 2>/dev/null || true
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true
   fi
+fi
+if [[ ! -x "$LAUNCHER" ]]; then
+  echo
+  echo "ℹ️  The helper app couldn't be built because Apple's developer tools look damaged."
+  echo "   Everything still works, but to get the helper app, reinstall the tools and"
+  echo "   run this script again:"
+  echo "     sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install"
 fi
 echo
 echo "Enter these in KOReader → Tools → iCloud Sync:"

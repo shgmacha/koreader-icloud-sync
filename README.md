@@ -224,6 +224,8 @@ No. Once the installer shows ✅, the helper runs in the background and starts a
 | **"Mac bridge not reachable"** | Make sure the Mac is awake and on the same Wi-Fi. If you clicked **Don't Allow** on a network prompt, allow it in **System Settings → Network → Firewall → Options**. |
 | **"Bad token"** | Re-enter the token. To see it again, run the installer again; it keeps the same token. |
 | **"cannot read sync folder: Operation not permitted"** | Give **KOReader iCloud Bridge** Full Disk Access. See [Step 1](#step-1-set-up-your-mac). |
+| **Installer shows `ld: tapi error: malformed file` or `linker command failed`** | Your Mac's developer tools are out of sync. Update with `git pull` and run the installer again; it now works around this. To repair the tools themselves: `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
+| **Installer shows `Bootstrap failed: 5: Input/output error`** | Update with `git pull` and run the installer again. |
 | **"Set the server address and token first"** | Fill in both under **Tools → iCloud Sync**. |
 | **iCloud Sync isn't in the Tools menu** | Check the folder is at `koreader/plugins/icloudsync.koplugin/main.lua`, and that it's ticked in **Tools → More tools → Plugin management**. |
 | **Nothing syncs automatically** | Check the auto-sync options are ticked. Automatic syncs wait 5 minutes between runs; **Sync now** always works. |
