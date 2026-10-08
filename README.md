@@ -190,7 +190,7 @@ KOReader needs to keep them next to the book, which is the default. Check **Sett
 <details>
 <summary><b>Some books are "still downloading to the Mac"</b></summary>
 
-With **Optimize Mac Storage** on, iCloud keeps some files only in the cloud. The helper asks your Mac to download them, and they sync on a later run. Nothing to do.
+With **Optimize Mac Storage** on, iCloud keeps some files only in the cloud. The helper spots them, asks your Mac to download them, and they sync on a later run. Nothing to do.
 
 </details>
 
@@ -226,8 +226,9 @@ No. Once the installer shows ✅, the helper runs in the background and starts a
 | **"cannot read sync folder: Operation not permitted"** | Give **KOReader iCloud Bridge** Full Disk Access. See [Step 1](#step-1-set-up-your-mac). |
 | **Installer shows `ld: tapi error: malformed file` or `linker command failed`** | Your Mac's developer tools are out of sync. Update with `git pull` and run the installer again; it now works around this. To repair the tools themselves: `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | **Installer shows `Bootstrap failed: 5: Input/output error`** | Update with `git pull` and run the installer again. |
+| **A sync "failed" and you want to know why** | Tap the **Last sync** line under **Tools → iCloud Sync** to see the reason, including which books failed. The full list is in `koreader/crash.log` (lines mentioning `icloudsync`). |
 | **"Set the server address and token first"** | Fill in both under **Tools → iCloud Sync**. |
-| **iCloud Sync isn't in the Tools menu** | Check the folder is at `koreader/plugins/icloudsync.koplugin/main.lua`, and that it's ticked in **Tools → More tools → Plugin management**. |
+| **iCloud Sync isn't in the Tools menu** | Check the folder is at `koreader/plugins/icloudsync.koplugin/main.lua` with all its files next to it (`icloudsync_plan.lua`, `icloudsync_engine.lua`, …), and that it's ticked in **Tools → More tools → Plugin management**. If a file is missing, KOReader skips the plugin without saying why: copy the whole folder again. |
 | **Nothing syncs automatically** | Check the auto-sync options are ticked. Automatic syncs wait 5 minutes between runs; **Sync now** always works. |
 | **The Mac's address keeps changing** | Give your Mac a fixed address in your router's settings (often called a "DHCP reservation"), or re-run the installer to see the new one. |
 
@@ -243,7 +244,9 @@ Still stuck? [Open an issue](https://github.com/shgmacha/koreader-icloud-sync/is
 ```bash
 cd ~/koreader-icloud-sync && git pull && ./bridge/install.sh
 ```
-Then copy the new `icloudsync.koplugin` folder from the [latest release](https://github.com/shgmacha/koreader-icloud-sync/releases/latest) to your Kindle. Your settings and token are kept.
+On the Kindle, open **Tools → iCloud Sync → Check for updates** and tap **Install**, then restart KOReader. The plugin also checks once a day on Wi-Fi and lets you know when there's a new version (turn this off with **Check for updates automatically**). Your settings and token are kept.
+
+You can still update by hand: copy the new `icloudsync.koplugin` folder from the [latest release](https://github.com/shgmacha/koreader-icloud-sync/releases/latest) to `koreader/plugins/` on your Kindle, replacing the old one.
 
 **Uninstall:**
 ```bash
@@ -266,7 +269,8 @@ Endpoints: `GET /health`, `GET /manifest`, `GET|PUT|DELETE /file/<path>`.
 ### What syncs, precisely
 
 - Book files with the extensions listed above, plus everything inside `*.sdr` folders except `*.old` backups
-- Skipped: hidden files, and names containing `: * ? " < > | \` (not allowed on Kindle storage)
+- Hidden files are skipped.
+- Kindle storage can't hold `: * ? " < > | \` or a name ending in `.` or a space. The bridge gives these files the same look-alike characters Finder uses when copying to a Kindle (for example `:` → `U+F022`), so they still sync. If two iCloud names would end up identical on the Kindle, one is left out and the Kindle reports it.
 
 ### Running the tests
 
@@ -275,6 +279,7 @@ Endpoints: `GET /health`, `GET /manifest`, `GET|PUT|DELETE /file/<path>`.
 luajit tests/test_syncplan.lua                         # sync rules
 luajit tests/test_syncengine.lua                       # sync engine (simulated Mac + Kindle)
 luajit tests/test_plugin_load.lua                      # plugin wiring (stubbed KOReader)
+luajit tests/test_update.lua                           # in-app updates
 ```
 
 Run the bridge by hand against any folder:

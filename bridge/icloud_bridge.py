@@ -54,7 +54,10 @@ def is_syncable(rel):
     for seg in parts:
         if seg in ("", ".", "..") or seg.startswith("."):
             return False
-        if any(c in FAT_ILLEGAL for c in seg):
+        if any(c in FAT_ILLEGAL or "\x01" <= c <= "\x1f" for c in seg):
+            return False
+        # The Kindle's FAT driver silently strips these, renaming the file.
+        if seg.endswith(".") or seg.endswith(" "):
             return False
     name = parts[-1]
     if name.endswith(".part") or name.endswith(".old"):
@@ -63,6 +66,44 @@ def is_syncable(rel):
         return True
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     return ext in ALLOWED_EXTS
+
+
+# Kindle-safe names: characters FAT can't store become Apple's SFM private-use
+# look-alikes, the same ones Finder writes when copying to a FAT drive.
+SFM_TO = {chr(c): chr(0xF000 + c) for c in range(0x01, 0x20)}
+SFM_TO.update(zip('"*:<>?\\|', map(chr, range(0xF020, 0xF028))))
+SFM_FROM = {v: k for k, v in SFM_TO.items()}
+SFM_FROM.update({"": " ", "": "."})
+
+
+def to_wire_segment(seg):
+    stripped = seg.rstrip(". ")
+    tail = seg[len(stripped):].replace(" ", "").replace(".", "")
+    return "".join(SFM_TO.get(c, c) for c in stripped) + tail
+
+
+def from_wire_segment(seg):
+    return "".join(SFM_FROM.get(c, c) for c in seg)
+
+
+def to_wire(rel):
+    """Real iCloud path -> the name the Kindle sees."""
+    return "/".join(to_wire_segment(s) for s in rel.split("/"))
+
+
+def resolve_wire(root, wire_rel):
+    """Real relative path for a Kindle-safe path. Per segment: an entry with
+    exactly that name wins, then one with the real characters; otherwise the
+    name is used as-is (a new file or folder)."""
+    real, cur = [], root
+    for seg in wire_rel.split("/"):
+        alt = from_wire_segment(seg)
+        if alt != seg and not os.path.lexists(os.path.join(cur, seg)) \
+                and os.path.lexists(os.path.join(cur, alt)):
+            seg = alt
+        real.append(seg)
+        cur = os.path.join(cur, seg)
+    return "/".join(real)
 
 
 def resolve_safe(root, rel):
@@ -105,27 +146,44 @@ def _raise(err):
     raise err
 
 
+SF_DATALESS = 0x40000000
+
+
+def is_dataless(st):
+    """macOS 14+ evicts iCloud files in place: same name, contents not on disk."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
 def build_manifest(root, downloader=None):
     """Raises OSError if any directory can't be read: a partial listing would
-    look like deletions to the client."""
-    files, pending = [], []
+    look like deletions to the client. Paths are Kindle-safe (see to_wire)."""
+    entries = {}  # wire path -> (real rel, kind, info)
+    unsupported = []
+
+    def add(rel, kind, info=None):
+        wire = to_wire(rel)
+        if not is_syncable(wire):
+            return
+        other = entries.get(wire)
+        if other:
+            # Two iCloud names map to one Kindle name: keep the one already
+            # spelled that way, report the other.
+            keep, drop = ((rel, kind, info), other) if rel == wire else (other, (rel, kind, info))
+            entries[wire] = keep
+            unsupported.append(drop[0])
+            return
+        entries[wire] = (rel, kind, info)
+
     os.listdir(root)  # surface permission errors on the root itself
     for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         rel_dir = os.path.relpath(dirpath, root)
         rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
         for name in filenames:
-            # Evicted iCloud file: ".Name.ext.icloud"
+            # Evicted iCloud file on older macOS: ".Name.ext.icloud"
             if name.startswith(".") and name.endswith(".icloud") and len(name) > 8:
-                real = name[1:-len(".icloud")]
-                rel = rel_dir + real
-                if is_syncable(rel):
-                    pending.append(rel)
-                    if downloader:
-                        downloader.request(os.path.join(dirpath, real))
-                continue
-            rel = rel_dir + name
-            if not is_syncable(rel):
+                add(rel_dir + name[1:-len(".icloud")], "pending",
+                    os.path.join(dirpath, name[1:-len(".icloud")]))
                 continue
             full = os.path.join(dirpath, name)
             try:
@@ -134,15 +192,27 @@ def build_manifest(root, downloader=None):
                 continue
             if not os.path.isfile(full) or os.path.islink(full):
                 continue
-            files.append({"path": rel, "size": st.st_size, "mtime": int(st.st_mtime)})
-    files.sort(key=lambda f: f["path"])
-    pending.sort()
+            if is_dataless(st):
+                add(rel_dir + name, "pending", full)
+            else:
+                add(rel_dir + name, "file", {"size": st.st_size, "mtime": int(st.st_mtime)})
+
+    files, pending = [], []
+    for wire in sorted(entries):
+        _rel, kind, info = entries[wire]
+        if kind == "pending":
+            pending.append(wire)
+            if downloader:
+                downloader.request(info)
+        else:
+            files.append(dict(path=wire, **info))
     return {
         "version": MANIFEST_VERSION,
         "root": os.path.basename(os.path.normpath(root)),
         "generated": int(time.time()),
         "files": files,
         "pending": pending,
+        "unsupported": sorted(unsupported),
     }
 
 
@@ -189,10 +259,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(got.encode("utf-8"), self.server.token.encode("utf-8"))
 
     def _route(self):
-        """Returns (kind, rel) or None after sending an error."""
+        """Returns (kind, wire_rel, full_path) or None after sending an error."""
         path = urlsplit(self.path).path
         if path == "/health":
-            return ("health", None)
+            return ("health", None, None)
         if not self._authorized():
             self._error(401, "bad token")
             return None
@@ -200,13 +270,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._error(500, "sync root missing")
             return None
         if path == "/manifest":
-            return ("manifest", None)
+            return ("manifest", None, None)
         if path.startswith("/file/"):
             rel = unquote(path[len("/file/"):])
-            if not is_syncable(rel) or resolve_safe(self.server.root, rel) is None:
+            full = is_syncable(rel) and resolve_safe(
+                self.server.root, resolve_wire(self.server.root, rel))
+            if not full:
                 self._error(403, "path not allowed")
                 return None
-            return ("file", rel)
+            return ("file", rel, full)
         self._error(404, "not found")
         return None
 
@@ -214,7 +286,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         r = self._route()
         if r is None:
             return
-        kind, rel = r
+        kind, rel, full = r
         if kind == "health":
             return self._send_json(200, {"ok": True})
         if kind == "manifest":
@@ -224,7 +296,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 log.error("cannot list sync root: %s", e)
                 return self._error(500, "cannot read sync folder: %s" % e.strerror)
             return self._send_json(200, manifest)
-        full = resolve_safe(self.server.root, rel)
         if not os.path.isfile(full):
             return self._error(404, "no such file")
         size = os.path.getsize(full)
@@ -242,7 +313,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         r = self._route()
         if r is None:
             return
-        kind, rel = r
+        kind, rel, full = r
         if kind != "file":
             return self._error(405, "method not allowed")
         try:
@@ -252,7 +323,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 raise ValueError
         except (TypeError, ValueError):
             return self._error(400, "Content-Length and X-Mtime required")
-        full = resolve_safe(self.server.root, rel)
         parent = os.path.dirname(full)
         os.makedirs(parent, exist_ok=True)
         tmp = os.path.join(parent, "." + os.path.basename(full) + ".koreader-part")
@@ -281,13 +351,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         r = self._route()
         if r is None:
             return
-        kind, rel = r
+        kind, rel, full = r
         if kind != "file":
             return self._error(405, "method not allowed")
-        full = resolve_safe(self.server.root, rel)
         if os.path.isfile(full):
             run_id = self.headers.get("X-Run-Id") or time.strftime("%Y-%m-%d_%H%M%S")
-            dest = trash_path(self.server.root, run_id, rel)
+            real_rel = os.path.relpath(full, os.path.realpath(self.server.root))
+            dest = trash_path(self.server.root, run_id, real_rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             os.replace(full, dest)
             prune_empty_dirs(os.path.dirname(full), self.server.root)

@@ -99,7 +99,8 @@ function SyncEngine.run(ctx)
     local plan = SyncPlan.reconcile(remote, locals, state, {
         pending = toSet(manifest.pending), skip = skip,
     })
-    summary.bad_names = #plan.bad_names
+    -- unsupported: iCloud names the bridge couldn't give a unique Kindle name.
+    summary.bad_names = #plan.bad_names + #(manifest.unsupported or {})
     summary.pending = #(manifest.pending or {})
 
     if not ctx.force_deletions then

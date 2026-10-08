@@ -154,16 +154,20 @@ test("bad token is reported as such", function()
     assert(lastShown().text:find("Bad token"), lastShown().text)
 end)
 
-test("auto sync is throttled, silent, and scheduled", function()
+test("auto sync is throttled, scheduled, and reports a failure once", function()
     http_reply = function() return "timeout" end
+    G_reader_settings.data.icloudsync.auto_update_check = false
     local p = newPlugin()
     local before = #shown
     p:onNetworkConnected()
     eq(#scheduled, 1)
     scheduled[1]()
-    eq(#shown, before, "auto sync failures stay quiet")
+    eq(#shown, before + 1)
+    eq(lastShown(), { kind = "Notification", text = "iCloud sync failed: Mac bridge not reachable (timeout)" })
     p:onNetworkConnected()
     eq(#scheduled, 1, "throttled within 5 minutes")
+    p:runSync{ auto = true }
+    eq(#shown, before + 1, "the same failure isn't repeated on every wake")
 end)
 
 test("open document and its sidecar are skipped", function()
@@ -213,7 +217,9 @@ test("transport download writes body to file", function()
     eq(data, "BOOKDATA")
     http_reply = function() return 404, "" end
     local ok, err = t.download("b.epub", os.tmpname())
-    eq({ ok, err }, { nil, "HTTP 404" })
+    eq({ ok, err }, { nil, "no longer in iCloud" })
+    http_reply = function() return 409, "" end
+    eq({ t.download("b.epub", os.tmpname()) }, { nil, "HTTP 409" })
 end)
 
 test("changed sync refreshes Bookshelf; up-to-date sync doesn't", function()
@@ -281,6 +287,179 @@ test("warns when sync folder is outside the home folder", function()
     eq(p:homeFolderWarning(), nil)
     G_reader_settings.data.home_dir = nil
     eq(p:homeFolderWarning(), nil)
+end)
+
+local function failedRun(n)
+    local errors = {}
+    for i = 1, n do errors[i] = "Fic/Book" .. i .. ".epub: no longer in iCloud" end
+    return { down = 1, up = 0, deleted_local = 0, deleted_remote = 0, failed = n,
+             changed = 1, errors = errors }
+end
+
+test("auto sync with failed files says why", function()
+    G_reader_settings.data.icloudsync = { server = "h:1", token = "t" }
+    local p = newPlugin()
+    Engine_run_once(failedRun(2))
+    p:runSync{ auto = true }
+    eq(lastShown(), { kind = "Notification",
+        text = "iCloud: 1 downloaded, 2 failed\nFic/Book1.epub: no longer in iCloud" })
+end)
+
+test("auto sync that held back deletions says so", function()
+    local p = newPlugin()
+    Engine_run_once({ down = 0, up = 0, deleted_local = 0, deleted_remote = 0, failed = 0,
+                      changed = 0, guard_tripped = 12 })
+    p:runSync{ auto = true }
+    eq(lastShown(), { kind = "Notification",
+        text = "iCloud: 12 deletions held back. Use Sync now to review them." })
+    eq(p:lastSyncText():match("— (.*)$"), "Up to date, 12 deletions held back")
+end)
+
+test("manual sync lists failure reasons and keeps them for the menu", function()
+    G_reader_settings.data.home_dir = "/mnt/us"
+    local p = newPlugin()
+    Engine_run_once(failedRun(7))
+    p:runSync{ auto = false }
+    local msg = lastShown()
+    eq(msg.kind, "InfoMessage")
+    eq(msg.timeout, nil, "stays up so it can be read")
+    eq(msg.text, table.concat({
+        "1 downloaded, 7 failed",
+        "Fic/Book1.epub: no longer in iCloud",
+        "Fic/Book2.epub: no longer in iCloud",
+        "Fic/Book3.epub: no longer in iCloud",
+        "…and 4 more (see koreader/crash.log)",
+    }, "\n"))
+    eq(#p.settings.last_sync.errors, 5, "at most 5 reasons stored")
+    local details = p:lastSyncDetails()
+    assert(details:find("Book5.epub") and details:find("and 2 more"), details)
+end)
+
+test("a crash while setting up a sync doesn't leave sync stuck", function()
+    local p = newPlugin()
+    local real = IO.newTransport
+    IO.newTransport = function() error("setup exploded") end
+    p:runSync{ auto = false }
+    IO.newTransport = real
+    assert(lastShown().text:find("setup exploded"), lastShown().text)
+    Engine_run_once({ down = 1, changed = 1 })
+    p:runSync{ auto = false }
+    eq(lastShown().text, "1 downloaded", "the next sync runs")
+end)
+
+test("menu line shows a short failure reason, details show it all", function()
+    local p = newPlugin()
+    local long = "Mac bridge error: cannot read sync folder: Operation not permitted"
+    p.settings.last_sync = { time = 0, error = long }
+    local line = p:lastSyncText()
+    assert(line:find("failed: Mac bridge error: cannot read sync folde…", 1, true), line)
+    eq(p:lastSyncDetails(), long)
+    p.settings.last_sync = { time = 0, error = "Ünïcödé ünïcödé ünïcödé ünïcödé ünï" }
+    local cut = p:lastSyncText():match("failed: (.*)…$")
+    assert(cut and not cut:find("[\192-\255]$"), "no half characters: " .. tostring(cut))
+    p.settings.last_sync = { time = 0, failed = 2 }
+    eq(p:lastSyncDetails(), "…and 2 more (see koreader/crash.log)", "v1.0 record without reasons")
+end)
+
+-- Updates ----------------------------------------------------------------------
+
+local Update = require("icloudsync_update")
+
+local function fakeUpdates(release)
+    local real = Update.deviceContext
+    Update.deviceContext = function(path, installed)
+        return { installed = installed, fetchJSON = function()
+            if type(release) == "string" then return nil, release end
+            return release
+        end }
+    end
+    return function() Update.deviceContext = real end
+end
+
+local NEWER = { tag_name = "v1.2.0", assets = {
+    { name = "icloudsync.koplugin.zip", browser_download_url = "https://x/z.zip" } } }
+
+test("menu has update items showing the installed version", function()
+    local p = newPlugin()
+    p.version = "1.1.0"
+    local items = {}
+    p:addToMainMenu(items)
+    local texts = {}
+    for _, item in ipairs(items.icloudsync.sub_item_table) do
+        texts[#texts + 1] = item.text or item.text_func()
+    end
+    assert(table.concat(texts, "|"):find("Check for updates (installed: 1.1.0)|Check for updates automatically", 1, true))
+end)
+
+test("check for updates: newer release asks before installing", function()
+    local restore = fakeUpdates(NEWER)
+    local p = newPlugin()
+    p.version = "1.1.0"
+    local installed_url
+    local real_install = Update.install
+    Update.install = function(_ctx, url) installed_url = url; return true end
+    local real_restart = package.loaded["ui/uimanager"].askForRestart
+    local restart_text
+    package.loaded["ui/uimanager"].askForRestart = function(_, text) restart_text = text end
+    p:checkForUpdates()
+    local box = lastShown()
+    eq(box.kind, "ConfirmBox")
+    eq(box.text, "iCloud Sync 1.2.0 is available (you have 1.1.0).\n\nInstall it now?")
+    box.ok_callback()
+    eq(installed_url, "https://x/z.zip")
+    assert(restart_text:find("1.2.0 is installed"), restart_text)
+    Update.install = real_install
+    package.loaded["ui/uimanager"].askForRestart = real_restart
+    restore()
+end)
+
+test("check for updates: up to date, unreachable, and failed install", function()
+    local p = newPlugin()
+    p.version = "1.2.0"
+    local restore = fakeUpdates(NEWER)
+    p:checkForUpdates()
+    eq(lastShown().text, "iCloud Sync is up to date (1.2.0).")
+    restore()
+    restore = fakeUpdates("no release published yet")
+    p:checkForUpdates()
+    eq(lastShown().text, "Couldn't check for updates:\nno release published yet")
+    restore()
+    local real_install = Update.install
+    Update.install = function() return nil, "Download failed: timeout" end
+    restore = fakeUpdates(NEWER)
+    p:installUpdate({ version = "1.3.0", url = "u" })
+    eq(lastShown().text, "iCloud Sync wasn't updated:\nDownload failed: timeout")
+    Update.install = function() error("disk on fire") end
+    p:installUpdate({ version = "1.3.0", url = "u" })
+    assert(lastShown().text:find("disk on fire"), "a crash is reported, not raised")
+    Update.install = real_install
+    restore()
+end)
+
+test("automatic update check runs once a day and only speaks up for news", function()
+    G_reader_settings.data.icloudsync = { server = "h:1", token = "t", auto_on_wifi = false }
+    local restore = fakeUpdates(NEWER)
+    local p = newPlugin()
+    p.version = "1.1.0"
+    scheduled = {}
+    p:onNetworkConnected()
+    eq(#scheduled, 1)
+    scheduled[1]()
+    eq(lastShown(), { kind = "Notification",
+        text = "iCloud Sync 1.2.0 is available: Tools → iCloud Sync → Check for updates." })
+    p:onNetworkConnected()
+    eq(#scheduled, 1, "not again the same day")
+    p.settings.last_update_check = os.time() - 25 * 3600
+    p.version = "1.2.0"
+    local before = #shown
+    p:onNetworkConnected()
+    scheduled[2]()
+    eq(#shown, before, "silent when up to date")
+    p.settings.auto_update_check = false
+    p.settings.last_update_check = 0
+    p:onNetworkConnected()
+    eq(#scheduled, 2, "off means off")
+    restore()
 end)
 
 H.done()

@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.parse import quote
 
 import icloud_bridge as b
@@ -30,6 +31,11 @@ SYNCABLE_CASES = [
     ("", False),
     ("What? A book.epub", False),
     ("Café – Ünïcode.pdf", True),
+    ("Smith Jr./Dune.epub", False),
+    ("Trailing /Dune.epub", False),
+    ("Tab\there.epub", False),
+    ("Good Girl #1 A Guide.epub", True),
+    ("Smith Jr/Dune.epub", True),
 ]
 
 
@@ -110,7 +116,66 @@ class HelperTests(unittest.TestCase):
 
     def test_manifest_empty_root(self):
         m = b.build_manifest(self.root)
-        self.assertEqual((m["files"], m["pending"]), ([], []))
+        self.assertEqual((m["files"], m["pending"], m["unsupported"]), ([], [], []))
+
+    def test_to_wire_maps_fat_illegal_and_trailing_chars(self):
+        cases = [
+            ("A: B.epub", "A B.epub"),
+            ('x*"<>?\\|.pdf', "x.pdf"),
+            ("Smith Jr./Dune.epub", "Smith Jr/Dune.epub"),
+            ("a. ./b.epub", "a/b.epub"),
+            ("Ctl\x01.epub", "Ctl.epub"),
+            ("Already safe.epub", "Already safe.epub"),
+            ("Plain/Dune.epub", "Plain/Dune.epub"),
+        ]
+        for real, wire in cases:
+            with self.subTest(real=real):
+                self.assertEqual(b.to_wire(real), wire)
+                self.assertTrue(b.is_syncable(wire))
+        self.assertEqual(b.from_wire_segment("a"), "a. .")
+
+    def test_manifest_lists_fat_illegal_names_under_kindle_safe_names(self):
+        self.touch("Holly: Book.epub", b"12")
+        self.touch("Smith Jr./Dune.epub")
+        m = b.build_manifest(self.root)
+        self.assertEqual([f["path"] for f in m["files"]],
+                         ["Holly Book.epub", "Smith Jr/Dune.epub"])
+        self.assertEqual(m["unsupported"], [])
+
+    def test_manifest_collision_keeps_kindle_safe_name(self):
+        self.touch("A:B.epub", b"colon")
+        self.touch("AB.epub", b"literal")
+        m = b.build_manifest(self.root)
+        self.assertEqual(m["files"][0]["path"], "AB.epub")
+        self.assertEqual(m["files"][0]["size"], len(b"literal"))
+        self.assertEqual(m["unsupported"], ["A:B.epub"])
+
+    def test_manifest_dataless_file_is_pending_and_triggers_download(self):
+        self.touch("Fic/Evicted.epub", b"x" * 50)
+        self.touch("Fic/Here.epub")
+        calls = []
+        evicted = lambda st: st.st_size == 50
+        with mock.patch.object(b, "is_dataless", evicted):
+            m = b.build_manifest(self.root, b.Downloader(runner=calls.append))
+        self.assertEqual([f["path"] for f in m["files"]], ["Fic/Here.epub"])
+        self.assertEqual(m["pending"], ["Fic/Evicted.epub"])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].endswith("Fic/Evicted.epub"))
+
+    def test_is_dataless_reads_st_flags(self):
+        self.assertTrue(b.is_dataless(mock.Mock(st_flags=0x40000000)))
+        self.assertFalse(b.is_dataless(mock.Mock(st_flags=0)))
+        self.assertFalse(b.is_dataless(object()), "no st_flags on this OS")
+
+    def test_resolve_wire(self):
+        self.touch("Holly: Book.epub")
+        self.touch("Both.epub")
+        self.touch("Both:.epub")
+        self.assertEqual(b.resolve_wire(self.root, "Holly Book.epub"), "Holly: Book.epub")
+        self.assertEqual(b.resolve_wire(self.root, "Both.epub"), "Both.epub",
+                         "the exact name wins")
+        self.assertEqual(b.resolve_wire(self.root, "New.epub"), "New.epub",
+                         "unknown names are kept as given")
 
 
 class EndpointTests(unittest.TestCase):
@@ -237,6 +302,30 @@ class EndpointTests(unittest.TestCase):
 
     def test_post_not_allowed(self):
         self.assertEqual(self.req("POST", "/file/a.epub", body=b"x")[0], 405)
+
+    def test_colon_file_reachable_through_kindle_safe_name(self):
+        self.write("Jr./Holly: Book.epub", b"colon-bytes")
+        wire = "/file/" + quote("Jr/Holly Book.epub")
+        self.assertEqual(self.req("GET", wire), (200, b"colon-bytes"))
+        status, data = self.req("PUT", wire, body=b"edited", headers={"X-Mtime": "7"})
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(data)["path"], "Jr/Holly Book.epub")
+        self.assertEqual(os.listdir(os.path.join(self.root, "Jr.")), ["Holly: Book.epub"],
+                         "overwrote the colon file, no duplicate")
+        self.assertEqual(self.req("DELETE", wire, headers={"X-Run-Id": "r"})[0], 204)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.root, ".koreader-trash/r/Jr./Holly: Book.epub")), "trashed under its real name")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "Jr.")))
+
+    def test_new_upload_keeps_kindle_safe_name(self):
+        status, _ = self.req("PUT", "/file/" + quote("New One.epub"), body=b"x",
+                             headers={"X-Mtime": "7"})
+        self.assertEqual(status, 201)
+        self.assertEqual(os.listdir(self.root), ["New One.epub"])
+
+    def test_raw_fat_illegal_and_trailing_dot_paths_still_forbidden(self):
+        self.assertEqual(self.req("GET", "/file/" + quote("A: B.epub"))[0], 403)
+        self.assertEqual(self.req("GET", "/file/" + quote("Jr./x.epub"))[0], 403)
 
 
 if __name__ == "__main__":

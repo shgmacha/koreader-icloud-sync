@@ -32,7 +32,11 @@ function SyncPlan.isSyncable(path)
         if seg == "" or seg == "." or seg == ".." or seg:sub(1, 1) == "." then
             return false
         end
-        if seg:find(FAT_ILLEGAL) then
+        if seg:find(FAT_ILLEGAL) or seg:find("[\1-\31]") then
+            return false
+        end
+        -- The Kindle's FAT driver silently strips these, renaming the file.
+        if seg:find("[%. ]$") then
             return false
         end
         segs[#segs + 1] = seg
@@ -122,7 +126,8 @@ function SyncPlan.reconcile(remote, locals, state, opts)
 
     for _, p in ipairs(paths) do
         if not SyncPlan.isSyncable(p) then
-            table.insert(plan.bad_names, p)
+            -- A record from an older, looser rule is just forgotten.
+            table.insert(remote[p] and plan.bad_names or plan.drop_state, p)
         elseif pending[p] or skip[p] then
             table.insert(plan.skipped, p)
         else

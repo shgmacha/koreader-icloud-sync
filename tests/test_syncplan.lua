@@ -21,6 +21,11 @@ local SYNCABLE_CASES = {
     { "", false },
     { "What? A book.epub", false },
     { "Café – Ünïcode.pdf", true },
+    { "Smith Jr./Dune.epub", false },
+    { "Trailing /Dune.epub", false },
+    { "Tab\there.epub", false },
+    { "Good Girl #1\u{F022} A Guide.epub", true },
+    { "Smith Jr\u{F029}/Dune.epub", true },
 }
 
 test("isSyncable matches the shared case table", function()
@@ -94,6 +99,17 @@ test("unsafe remote paths are reported, never acted on", function()
     local plan = SyncPlan.reconcile(remote, {}, {})
     eq(plan.download, { "ok.epub" })
     eq(plan.bad_names, { "../escape.epub", "/etc/x.epub" })
+end)
+
+test("a record that only fails the stricter rule is dropped, not reported", function()
+    -- v1.0 synced "Smith Jr./Dune.epub"; the Kindle's copy really sits at "Smith Jr/".
+    local state = { ["Smith Jr./Dune.epub"] = S(4, 100, 100) }
+    local remote = { ["Smith Jr\u{F029}/Dune.epub"] = F(4, 100) }
+    local plan = SyncPlan.reconcile(remote, {}, state)
+    eq(plan.drop_state, { "Smith Jr./Dune.epub" })
+    eq(plan.bad_names, {})
+    eq(plan.download, { "Smith Jr\u{F029}/Dune.epub" })
+    eq(#plan.delete_local + #plan.delete_remote, 0, "nothing deleted")
 end)
 
 test("second pass after applying plan is a no-op", function()

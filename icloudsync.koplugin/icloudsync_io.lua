@@ -23,6 +23,7 @@ do
         json_decode = require("json").decode
     end
 end
+IO.json_decode = json_decode
 
 local function urlEncodeSegment(s)
     return (s:gsub("[^%w%-%._~]", function(c)
@@ -44,11 +45,14 @@ local function describe(code, body)
     if type(code) ~= "number" then
         return "Mac bridge not reachable (" .. tostring(code) .. ")"
     end
+    if code == 403 then return "name not allowed by the Mac bridge" end
+    if code == 404 then return "no longer in iCloud" end
     local msg
     if body and body ~= "" then
         local ok, obj = pcall(json_decode, body)
         msg = ok and type(obj) == "table" and obj.error
     end
+    if code == 500 then return "Mac bridge error: " .. (msg or "see its log") end
     return "HTTP " .. code .. (msg and (": " .. msg) or "")
 end
 

@@ -16,7 +16,7 @@ local function world(opts)
             for p, f in pairs(W.mac) do
                 files[#files + 1] = { path = p, size = #f.data, mtime = f.mtime }
             end
-            return { version = 1, files = files, pending = W.pending or {} }
+            return { version = 1, files = files, pending = W.pending or {}, unsupported = W.unsupported }
         end,
         download = function(p, dest)
             table.insert(W.calls, "GET " .. p)
@@ -238,6 +238,14 @@ test("bad manifest version aborts", function()
     local W = world()
     W.transport.manifest = function() return { version = 2, files = {} } end
     eq(W.run().error, "unsupported bridge version")
+end)
+
+test("names the bridge couldn't map count as bad names", function()
+    local W = world()
+    W.unsupported = { "A:B.epub", "Dup/C:D.epub" }
+    eq(W.run().bad_names, 2)
+    W.unsupported = nil
+    eq(W.run().bad_names, 0, "older bridge without the field")
 end)
 
 H.done()
